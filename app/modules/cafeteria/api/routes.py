@@ -1,125 +1,104 @@
-import csv
-import io
-from typing import Optional
-from fastapi import APIRouter, HTTPException
+"""
+Cafeteria Module API Endpoints.
+All business logic is delegated to the application layer (Use Cases).
+
+Author: Danilo Castillejo
+Role: Developer of the cafeteria module
+"""
+
+from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import StreamingResponse
-from sqlmodel import select
 from app.core.db import SessionDep
 
-from app.modules.cafeteria.infrastructure.models import Cafeteria
-from app.modules.enrollment.infrastructure.models import Estudiante, Grado
-from app.modules.cafeteria.application.service import (
-    sync_students_to_cafeteria,
-    set_manual_no_paz_y_salvo,
-    bulk_assign_paz_y_salvo,
-    bulk_remove_manual_blocks,
+# Use Cases
+from app.modules.cafeteria.application.get_status import GetStatus
+from app.modules.cafeteria.application.get_student_status import GetStudentStatus
+from app.modules.cafeteria.application.create_observation import CreateObservation
+from app.modules.cafeteria.application.update_status import UpdateStatus
+from app.modules.cafeteria.application.remove_block import RemoveBlock
+from app.modules.cafeteria.application.export_report import ExportReport
+
+# Schemas
+from app.modules.cafeteria.schemas.request import (
+    ManualBlockRequest,
+    BulkPazSalvoRequest,
+    BulkRemoveBlockRequest,
 )
-from app.modules.cafeteria.schemas.schemas import (
-    ManualBlockSchema,
-    BulkPazSalvoSchema,
-    BulkRemoveBlockSchema,
+from app.shared.utils.response import Response
+
+router = APIRouter()
+
+
+@router.get("/list/{periodo_id}", summary="Get all students status")
+async def get_list(periodo_id: int, session: SessionDep):
+    use_case = GetStatus(session)
+    data = await use_case.execute(periodo_id)
+    return Response(
+        data=data, message="List obtained successfully", status_code=status.HTTP_200_OK
+    ).to_dict()
+
+
+@router.get(
+    "/status/{estudiante_id}/{periodo_id}", summary="Get individual student status"
 )
-
-router = APIRouter(prefix="/cafeteria", tags=["Cafeteria"])
-
-
-@router.get("/list/{periodo_id}")
-def list_cafeteria_students(
-    periodo_id: int, session: SessionDep, grado_id: Optional[int] = None
+async def get_individual_status(
+    estudiante_id: int, periodo_id: int, session: SessionDep
 ):
-    # Eliminamos el = None en session para cumplir con PEP 484
-    sync_students_to_cafeteria(session, periodo_id)
-    statement = select(Cafeteria).where(Cafeteria.periodo_id == periodo_id)
-    if grado_id:
-        statement = statement.join(Estudiante).where(Estudiante.grado_id == grado_id)
-    return session.exec(statement).all()
+    use_case = GetStudentStatus(session)
+    data = await use_case.execute(estudiante_id, periodo_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Record not found")
+    return Response(
+        data=data, message="Status obtained", status_code=status.HTTP_200_OK
+    ).to_dict()
 
 
-@router.post("/manual-block")
-def manual_block(data: ManualBlockSchema, session: SessionDep):
+@router.post("/manual-block", summary="Mark student as debtor")
+async def manual_block(session: SessionDep, request: ManualBlockRequest):
+    use_case = CreateObservation(session)
     try:
-        return set_manual_no_paz_y_salvo(
-            session, data.registro_id, data.usuario_id, data.observaciones
+        data = await use_case.execute(
+            request.registro_id, request.usuario_id, request.observaciones
         )
+        return Response(
+            data=data,
+            message="Manual block successful",
+            status_code=status.HTTP_201_CREATED,
+        ).to_dict()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/bulk-paz-y-salvo")
-def bulk_paz_y_salvo(data: BulkPazSalvoSchema, session: SessionDep):
-    try:
-        return bulk_assign_paz_y_salvo(
-            session, data.periodo_id, data.estudiantes_ids, data.usuario_id
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/bulk-remove-blocks")
-def bulk_remove_blocks(data: BulkRemoveBlockSchema, session: SessionDep):
-    try:
-        cantidad = bulk_remove_manual_blocks(
-            session, data.registro_ids, data.usuario_id
-        )
-        return {
-            "message": f"Se actualizó el estado de {cantidad} registros correctamente."
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/status/{estudiante_id}/{periodo_id}")
-def get_student_status(estudiante_id: int, periodo_id: int, session: SessionDep):
-    statement = select(Cafeteria).where(
-        Cafeteria.estudiante_id == estudiante_id, Cafeteria.periodo_id == periodo_id
+@router.post("/bulk-paz-y-salvo", summary="Massive Paz y Salvo assignment")
+async def bulk_paz_y_salvo(session: SessionDep, request: BulkPazSalvoRequest):
+    use_case = UpdateStatus(session)
+    data = await use_case.execute(
+        request.periodo_id, request.estudiantes_ids, request.usuario_id
     )
-    result = session.exec(statement).first()
-    if not result:
-        raise HTTPException(status_code=404, detail="No encontrado")
-    return result
+    return Response(
+        data=data, message="Bulk operation completed", status_code=status.HTTP_200_OK
+    ).to_dict()
 
 
-@router.get("/export/{periodo_id}")
-def export_cafeteria_report(periodo_id: int, session: SessionDep):
-    # Corregimos el JOIN para que Mypy no se queje del tipo bool
-    statement = (
-        select(Cafeteria, Estudiante, Grado)
-        .where(Cafeteria.estudiante_id == Estudiante.id)
-        .where(Estudiante.grado_id == Grado.id)
-        .where(Cafeteria.periodo_id == periodo_id)
-    )
-    results = session.exec(statement).all()
+@router.post("/remove-blocks", summary="Remove manual blocks in bulk")
+async def remove_blocks(session: SessionDep, request: BulkRemoveBlockRequest):
+    use_case = RemoveBlock(session)
+    count = await use_case.execute(request.registro_ids, request.usuario_id)
+    return Response(
+        data={"updated": count},
+        message="Blocks removed successfully",
+        status_code=status.HTTP_200_OK,
+    ).to_dict()
 
-    output = io.StringIO()  # type: ignore[abstract]
-    writer = csv.writer(output)
-    writer.writerow(
-        ["DOCUMENTO", "ESTUDIANTE", "CURSO", "ESTADO", "OBSERVACIONES", "FECHA"]
-    )
 
-    for cafeteria_reg, estudiante_reg, grado_reg in results:
-        # Validamos que updated_at no sea None antes de usar strftime
-        fecha_str = (
-            cafeteria_reg.updated_at.strftime("%Y-%m-%d")
-            if cafeteria_reg.updated_at
-            else "N/A"
-        )
-
-        writer.writerow(
-            [
-                estudiante_reg.documento,
-                estudiante_reg.nombre,
-                grado_reg.nombre,
-                "PAZ Y SALVO" if cafeteria_reg.estado_cafeteria else "DEUDA",
-                cafeteria_reg.observaciones or "",
-                fecha_str,
-            ]
-        )
-
-    output.seek(0)
+@router.get("/export/{periodo_id}", summary="Download CSV Report")
+async def export_csv(periodo_id: int, session: SessionDep):
+    use_case = ExportReport(session)
+    csv_content = await use_case.execute(periodo_id)
     return StreamingResponse(
-        iter([output.getvalue()]),
+        iter([csv_content]),
         media_type="text/csv",
         headers={
-            "Content-Disposition": f"attachment; filename=reporte_cafeteria_{periodo_id}.csv"
+            "Content-Disposition": f"attachment; filename=report_cafeteria_{periodo_id}.csv"
         },
     )
