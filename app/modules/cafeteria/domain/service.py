@@ -1,11 +1,4 @@
 """
-Cafeteria Module Domain Service.
-
-This service implements the core business rules:
-1. Automatic synchronization of active students.
-2. Manual blocking (marking debt) with mandatory comments.
-3. Bulk update that protects manually blocked records.
-
 Author: Danilo Castillejo
 Role: Developer of the cafeteria module
 """
@@ -19,60 +12,39 @@ class CafeteriaService:
     def __init__(self, repository: CafeteriaRepositoryInterface):
         self.repository = repository
 
-    async def sync_students(self, periodo_id: int) -> None:
-        """
-        Ensures the cafeteria table is populated with all active students.
-        If a student is active but has no record for the period, one is created.
-        """
-        students = await self.repository.get_active_students()
-        for student in students:
-            if student.id is None:
-                continue
-            exists = await self.repository.get_by_student_and_period(
-                student.id, periodo_id
+    async def get_student_status(
+        self, estudiante_id: int, periodo_id: int
+    ) -> Cafeteria | None:
+        return await self.repository.get_by_student_and_period(
+            estudiante_id, periodo_id
+        )
+
+    async def format_report_data(self, periodo_id: int) -> list[list[str]]:
+        """Logic for report formatting. Presentation strings live here."""
+        records = await self.repository.get_all_by_period(periodo_id)
+        report_rows = []
+        for reg in records:
+            status_text = "PAZ Y SALVO" if reg.estado_cafeteria else "DEUDA"
+            report_rows.append(
+                [str(reg.estudiante_id), status_text, reg.observaciones or ""]
             )
-            if not exists:
-                new_record = Cafeteria(
-                    estudiante_id=student.id,
-                    periodo_id=periodo_id,
-                    estado_cafeteria=True,  # Default to Paz y Salvo
-                )
-                await self.repository.save(new_record)
+        return report_rows
 
-    async def get_status_list(self, periodo_id: int) -> list[dict]:
-        """Returns a formatted list of students and their cafeteria status."""
-        await self.sync_students(periodo_id)
-        results = await self.repository.get_all_by_period(periodo_id)
+    async def get_status_list(self, periodo_id: int) -> list[Cafeteria]:
+        """Returns the list of cafeteria records."""
+        return await self.repository.get_all_by_period(periodo_id)
 
-        # Formatting the response into a simple dictionary list for the frontend
-        return [
-            {
-                "id": c.id,
-                "estudiante": e.nombre,
-                "documento": e.documento,
-                "estado": c.estado_cafeteria,
-                "observaciones": c.observaciones,
-            }
-            for c, e in results
-        ]
-
-    async def create_manual_block(self, registro_id: int, usuario_id: int, obs: str):
-        """
-        Marks a student as 'No Paz y Salvo' manually.
-        Validation: Observations are mandatory for manual blocks.
-        """
+    async def create_manual_block(
+        self, registro_id: int, usuario_id: int, obs: str
+    ) -> Cafeteria:
         if not obs or len(obs.strip()) < 5:
-            raise ValueError("A valid observation is mandatory for manual blocks.")
-
-        user = await self.repository.get_user_by_id(usuario_id)
-        if not user:
-            raise ValueError("Responsible user not found.")
+            raise ValueError("Observation is mandatory for manual blocks.")
 
         record = await self.repository.get_by_id(registro_id)
         if not record:
-            raise ValueError("Cafeteria record not found.")
+            raise ValueError("Record not found")
 
-        record.estado_cafeteria = False  # Blocked
+        record.estado_cafeteria = False
         record.observaciones = obs
         record.usuario_id = usuario_id
         record.updated_at = datetime.now()
@@ -80,21 +52,13 @@ class CafeteriaService:
 
     async def bulk_update_paz_y_salvo(
         self, periodo_id: int, estudiantes_ids: list[int], usuario_id: int
-    ) -> dict:
-        """
-        The 'Select All' logic.
-        CRITICAL RULE: If a student is already marked as False (Debt),
-        the bulk operation MUST NOT overwrite it.
-        """
+    ) -> dict[str, int]:
         actualizados, excluidos = 0, 0
         for est_id in estudiantes_ids:
             record = await self.repository.get_by_student_and_period(est_id, periodo_id)
-
-            # If record exists and is already False (Manual Block), we skip it.
             if record and not record.estado_cafeteria:
                 excluidos += 1
             elif record:
-                # Only update those who are currently True or new.
                 record.estado_cafeteria = True
                 record.usuario_id = usuario_id
                 await self.repository.save(record)
@@ -109,14 +73,12 @@ class CafeteriaService:
     async def bulk_remove_manual_blocks(
         self, usuario_id: int, registro_ids: list[int]
     ) -> int:
-        """CAF-RF-09: Removes manual blocks for multiple records."""
+        records = await self.repository.get_multiple_by_ids(registro_ids)
         count = 0
-        for rid in registro_ids:
-            record = await self.repository.get_by_id(rid)
-            if record:
-                record.estado_cafeteria = True
-                record.usuario_id = usuario_id
-                record.observaciones = "Bloqueo retirado manualmente"
-                await self.repository.save(record)
-                count += 1
+        for reg in records:
+            reg.estado_cafeteria = True
+            reg.usuario_id = usuario_id
+            reg.observaciones = "Bloqueo retirado manualmente"
+            await self.repository.save(reg)
+            count += 1
         return count
